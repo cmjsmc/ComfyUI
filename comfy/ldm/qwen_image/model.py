@@ -12,6 +12,11 @@ import comfy.ldm.common_dit
 import comfy.patcher_extension
 from comfy.ldm.flux.math import apply_rope1
 
+def clamp_fp16(x):
+    if x.dtype == torch.float16:
+        return torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
+    return x
+
 class GELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, approximate: str = "none", bias: bool = True, dtype=None, device=None, operations=None):
         super().__init__()
@@ -21,7 +26,7 @@ class GELU(nn.Module):
     def forward(self, hidden_states):
         hidden_states = self.proj(hidden_states)
         hidden_states = F.gelu(hidden_states, approximate=self.approximate)
-        return hidden_states
+        return clamp_fp16(hidden_states)
 
 
 class FeedForward(nn.Module):
@@ -248,6 +253,9 @@ class QwenImageTransformerBlock(nn.Module):
             image_rotary_emb=image_rotary_emb,
             transformer_options=transformer_options,
         )
+        img_attn_output = clamp_fp16(img_attn_output)
+        txt_attn_output = clamp_fp16(txt_attn_output)
+        
         del img_modulated
         del txt_modulated
 
@@ -259,10 +267,10 @@ class QwenImageTransformerBlock(nn.Module):
         del txt_gate1
 
         img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
-        hidden_states = torch.addcmul(hidden_states, img_gate2, self.img_mlp(img_modulated2))
+        hidden_states = torch.addcmul(hidden_states, img_gate2, clamp_fp16(self.img_mlp(img_modulated2)))
 
         txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
-        encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2))
+        encoder_hidden_states = torch.addcmul(encoder_hidden_states, txt_gate2, clamp_fp16(self.txt_mlp(txt_modulated2)))
 
         return encoder_hidden_states, hidden_states
 
