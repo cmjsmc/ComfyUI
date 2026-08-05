@@ -219,7 +219,7 @@ def _mod_scale_shift(h, shift, scale, segments):
 def _mod_gate(x, gate, other, segments):
     # other is the fresh attn/mlp output: accumulate the gated residual into the stream in place, one fused kernel per segment
     for a, b, row in segments:
-        x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
+        x[a:b].addcmul_(other[a:b].to(x.dtype), gate[row].to(x.dtype))
     return x
 
 
@@ -265,11 +265,12 @@ class DiTBlock(nn.Module):
                                     device=device, operations=operations)
 
     def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+        compute_dtype = t_emb.dtype
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
-        h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
+        h = _mod_scale_shift(self.norm1(x.to(compute_dtype)), shift_msa, scale_msa, mod_segments)
         x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
-        h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
-        return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+        h2 = _mod_scale_shift(self.norm2(x.to(compute_dtype)), shift_mlp, scale_mlp, mod_segments)
+        return _mod_gate(x, gate_mlp, self.mlp(h2), mod_segments)
 
 
 class FinalLayer(nn.Module):
@@ -289,8 +290,8 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaln_proj(t_emb)
         va, vb, vrow = video_seg
         aa, ab, arow = audio_seg
-        hv = (self.norm(x[va:vb]) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
-        ha = (self.norm(x[aa:ab]) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
+        hv = (self.norm(x[va:vb].to(t_emb.dtype)) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
+        ha = (self.norm(x[aa:ab].to(t_emb.dtype)) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
         return self.video_out(hv), self.audio_out(ha)
 
 
@@ -585,17 +586,18 @@ class MiniMaxH3Model(nn.Module):
                                              transformer_options=transformer_options)
 
         # segments are contiguous: assemble by slices, embed rows follow segment order
-        h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
+        residual_dtype = torch.float32 if dtype == torch.float16 else dtype
+        h = torch.empty(layout.seq_len, self.hidden_size, dtype=residual_dtype, device=device)
         voff = aoff = 0
         for a, b, kind in layout.segments:
             n = b - a
             if kind == "text":
-                h[a:b] = text_states
+                h[a:b] = text_states.to(residual_dtype)
             elif kind in ("cond", "ref_img", "video"):
-                h[a:b] = video_embed[voff:voff + n]
+                h[a:b] = video_embed[voff:voff + n].to(residual_dtype)
                 voff += n
             else:  # ref_audio / audio
-                h[a:b] = audio_embed[aoff:aoff + n]
+                h[a:b] = audio_embed[aoff:aoff + n].to(residual_dtype)
                 aoff += n
 
         t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
