@@ -265,7 +265,9 @@ class DiTBlock(nn.Module):
                                     device=device, operations=operations)
 
     def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
-        compute_dtype = t_emb.dtype
+        # t_emb is strictly fp32 in curve variants, so we pull compute dtype from rope_freqs
+        compute_dtype = rope_freqs.dtype
+        
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x.to(compute_dtype)), shift_msa, scale_msa, mod_segments)
         x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
