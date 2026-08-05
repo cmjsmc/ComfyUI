@@ -32,6 +32,12 @@ VISUAL_COND_TIMESTEP = 0.999
 AUDIO_COND_TIMESTEP = 1.0
 
 
+def clamp_fp16(x):
+    if x.dtype == torch.float16:
+        return torch.nan_to_num(x, nan=0.0, posinf=65504.0, neginf=-65504.0)
+    return x
+
+
 def time_shift_sigma(sigma, from_shift, to_shift):
     # invert sigma = s*b/(1+(s-1)*b) to the base grid, re-apply the other shift
     base = sigma / (from_shift + sigma * (1.0 - from_shift))
@@ -233,8 +239,8 @@ class RefinerBlock(nn.Module):
 
     def forward(self, x, transformer_options={}):
         # attn/mlp outputs are fresh: accumulate residuals in place
-        x = self.attn(self.norm1(x), transformer_options=transformer_options).add_(x)
-        return self.mlp(self.norm2(x)).add_(x)
+        x = clamp_fp16(self.attn(self.norm1(x), transformer_options=transformer_options)).add_(x)        
+        return clamp_fp16(self.mlp(self.norm2(x))).add_(x)
 
 
 class TokenRefiner(nn.Module):
@@ -270,9 +276,11 @@ class DiTBlock(nn.Module):
         
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x.to(compute_dtype)), shift_msa, scale_msa, mod_segments)
-        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
+        x = _mod_gate(x, gate_msa, clamp_fp16(self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)), mod_segments)
         h2 = _mod_scale_shift(self.norm2(x.to(compute_dtype)), shift_mlp, scale_mlp, mod_segments)
-        return _mod_gate(x, gate_mlp, self.mlp(h2), mod_segments)
+        
+        return _mod_gate(x, gate_mlp, clamp_fp16(self.mlp(h2)), mod_segments)
+
 
 
 class FinalLayer(nn.Module):
