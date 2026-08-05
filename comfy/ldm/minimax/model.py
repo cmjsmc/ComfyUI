@@ -640,7 +640,7 @@ class MiniMaxH3Model(nn.Module):
             
             # Copy options to avoid mutating the global dictionary, set force_fp32 for boundary layers
             block_opts = transformer_options.copy()
-            block_opts["force_fp32"] = (i < 3 or i >= len(self.blocks) - 3)
+            block_opts["force_fp32"] = (i < 6 or i >= len(self.blocks) - 6)
             
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
