@@ -253,6 +253,8 @@ class TokenRefiner(nn.Module):
         self.final_norm = operations.RMSNorm(hidden, eps=final_eps, dtype=dtype, device=device)
 
     def forward(self, x, transformer_options={}):
+        # Force the refiners at the absolute start of the network into fp32
+        x = x.to(torch.float32)
         for block in self.blocks:
             x = block(x, transformer_options=transformer_options)
         return self.final_norm(x)
@@ -270,8 +272,11 @@ class DiTBlock(nn.Module):
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, force_fp32=False, transformer_options={}):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+        # Check if this specific block is flagged for fp32 compute
+        force_fp32 = transformer_options.get("force_fp32", False)
         compute_dtype = torch.float32 if force_fp32 else rope_freqs.dtype
+        
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x.to(compute_dtype)), shift_msa, scale_msa, mod_segments)
         x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
@@ -633,19 +638,20 @@ class MiniMaxH3Model(nn.Module):
         for i, block in enumerate(self.blocks):
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
             
-            # Force fp32 on the first and last layer to prevent precision collapse
-            force_fp32 = (i == 0 or i == len(self.blocks) - 1)
+            # Copy options to avoid mutating the global dictionary, set force_fp32 for boundary layers
+            block_opts = transformer_options.copy()
+            block_opts["force_fp32"] = (i < 3 or i >= len(self.blocks) - 3)
             
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
                     return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],
-                                         force_fp32=args["force_fp32"], transformer_options=args["transformer_options"])}
+                                         transformer_options=args["transformer_options"])}
                 h = blocks_replace[("double_block", i)](
                     {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
-                     "force_fp32": force_fp32, "transformer_options": transformer_options},
+                     "transformer_options": block_opts},
                     {"original_block": block_wrap})["img"]
             else:
-                h = block(h, t_emb, mod_segments, rope_freqs, force_fp32=force_fp32, transformer_options=transformer_options)
+                h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=block_opts)
         if prefetch_queue is not None:
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
