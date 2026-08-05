@@ -270,16 +270,13 @@ class DiTBlock(nn.Module):
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
-        # t_emb is strictly fp32 in curve variants, so we pull compute dtype from rope_freqs
-        compute_dtype = rope_freqs.dtype
-        
+    def forward(self, x, t_emb, mod_segments, rope_freqs, force_fp32=False, transformer_options={}):
+        compute_dtype = torch.float32 if force_fp32 else rope_freqs.dtype
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x.to(compute_dtype)), shift_msa, scale_msa, mod_segments)
-        x = _mod_gate(x, gate_msa, clamp_fp16(self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)), mod_segments)
+        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
         h2 = _mod_scale_shift(self.norm2(x.to(compute_dtype)), shift_mlp, scale_mlp, mod_segments)
-        
-        return _mod_gate(x, gate_mlp, clamp_fp16(self.mlp(h2)), mod_segments)
+        return _mod_gate(x, gate_mlp, self.mlp(h2), mod_segments)
 
 
 
@@ -300,8 +297,14 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaln_proj(t_emb)
         va, vb, vrow = video_seg
         aa, ab, arow = audio_seg
-        hv = (self.norm(x[va:vb].to(t_emb.dtype)) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
-        ha = (self.norm(x[aa:ab].to(t_emb.dtype)) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
+        
+        # Upcast inputs to fp32 so the norm and scaling calculations are protected
+        x_v = x[va:vb].to(torch.float32)
+        x_a = x[aa:ab].to(torch.float32)
+        
+        hv = self.norm(x_v) * (1.0 + scale[vrow]) + shift[vrow]
+        ha = self.norm(x_a) * (1.0 + scale[arow]) + shift[arow]
+        
         return self.video_out(hv), self.audio_out(ha)
 
 
@@ -629,16 +632,20 @@ class MiniMaxH3Model(nn.Module):
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.blocks), device, transformer_options)
         for i, block in enumerate(self.blocks):
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
+            
+            # Force fp32 on the first and last layer to prevent precision collapse
+            force_fp32 = (i == 0 or i == len(self.blocks) - 1)
+            
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
                     return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],
-                                         transformer_options=args["transformer_options"])}
+                                         force_fp32=args["force_fp32"], transformer_options=args["transformer_options"])}
                 h = blocks_replace[("double_block", i)](
                     {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
-                     "transformer_options": transformer_options},
+                     "force_fp32": force_fp32, "transformer_options": transformer_options},
                     {"original_block": block_wrap})["img"]
             else:
-                h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
+                h = block(h, t_emb, mod_segments, rope_freqs, force_fp32=force_fp32, transformer_options=transformer_options)
         if prefetch_queue is not None:
             comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
 
